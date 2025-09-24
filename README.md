@@ -1,5 +1,7 @@
 The backtest covers EURUSD on M1 timeframe from September 1 to September 24, 2025.
 
+
+(Updated) https://grok.com/share/c2hhcmQtMg%3D%3D_fe327882-e8a0-460b-9d07-327f9111466d
 https://grok.com/share/c2hhcmQtMg%3D%3D_6422d2fa-e632-4239-b3b7-48f46c8622e4
 
 Changes Made
