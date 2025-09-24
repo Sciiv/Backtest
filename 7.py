@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # For Python 3.9+; use 'pytz' if needed
+from zoneinfo import ZoneInfo
 import torch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
@@ -22,7 +22,9 @@ def sharpe_ratio(returns, risk_free_rate=0.0):
 def sortino_ratio(returns, risk_free_rate=0.0):
     returns = np.array(returns, dtype=float)
     downside_returns = returns[returns < 0]
-    return (np.mean(returns) - risk_free_rate) / np.std(downside_returns) if len(downside_returns) > 0 else np.inf
+    std_downside = np.std(downside_returns) if len(downside_returns) > 0 else 1e-10
+    ratio = (np.mean(returns) - risk_free_rate) / std_downside if len(downside_returns) > 0 else 0
+    return min(ratio, 10)  # Cap at 10 to avoid inf plotting issues
 
 def max_drawdown(returns):
     returns = np.array(returns, dtype=float)
@@ -31,7 +33,7 @@ def max_drawdown(returns):
     drawdown = (cum_returns - peak) / (peak + 1e-10)
     return np.min(drawdown) if len(drawdown) > 0 else 0
 
-# GPU-intensive Monte Carlo simulation using PyTorch
+# GPU-intensive Monte Carlo
 def monte_carlo_gpu(returns, n_sims=10000, n_trades=100):
     returns = np.array(returns, dtype=np.float32)
     if torch.cuda.is_available():
@@ -46,89 +48,64 @@ def monte_carlo_gpu(returns, n_sims=10000, n_trades=100):
         cum_returns = np.cumprod(1 + resampled_returns, axis=1)[:, -1]
         return cum_returns - 1
 
-# Initialize MT5 connection
+# Initialize MT5
 if not mt5.initialize():
     print("MT5 initialize() failed, error code:", mt5.last_error())
     quit()
 
-# Set timezone manually (e.g., CDT for your location)
-timezone = ZoneInfo("America/Chicago")  # CDT (UTC-5 during DST on Sep 24, 2025)
-utc_from = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=7)  # Last 7 days
+timezone = ZoneInfo("America/Chicago")
+utc_from = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=7)
 
-# Pull historical M1 data for EURUSD
+# Pull data
 symbol = "EURUSD"
-rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M1, utc_from, 10080)  # 10080 M1 bars = 7 days
-
+rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M1, utc_from, 10080)
 if rates is None:
     print("Failed to pull rates:", mt5.last_error())
 else:
     df = pd.DataFrame(rates)
-    # Convert time column to datetime and set as index
     df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
     df.set_index('time', inplace=True)
-    # Convert to local timezone (CDT)
     df.index = df.index.tz_convert(timezone)
     print(f"Pulled {len(df)} M1 bars for {symbol}")
-    print(df.tail())  # Sample output
+    print(df.tail())
 
-# Pull recent trade history (e.g., last 10 deals) and compute returns
+# Simulate returns
 deals = mt5.history_deals_get(utc_from, datetime.now(tz=ZoneInfo("UTC")))
 if deals:
-    trade_returns = []
-    for deal in deals[-10:]:  # Last 10 deals
-        if deal.symbol == symbol and deal.type in [mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL]:
-            profit = deal.profit  # Raw profit in account currency
-            volume = deal.volume
-            return_pct = (profit / (volume * 100000)) * 100  # Approx % return (adjust for pip value)
-            trade_returns.append(return_pct / 100)  # As decimal
-    print(f"Recent trade returns: {trade_returns}")
+    trade_returns = [deal.profit / (deal.volume * 100000) * 100 / 100 for deal in deals[-10:] if deal.symbol == symbol and deal.type in [mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL]]
 else:
-    # Fallback: Simulate returns from rates (e.g., based on EMA signals)
-    # Calculate ATR for volatility filter
     df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['atr'] = df['tr'].rolling(window=14).mean()
-    atr_threshold = 0.0005  # Volatility threshold for trading (adjust as needed)
-
-    df['ema_fast'] = df['close'].ewm(span=2).mean()  # Reduced to 2 for more signals
-    df['ema_slow'] = df['close'].ewm(span=5).mean()  # Reduced to 5 for more signals
-    # Convert signals to pandas Series with df index
-    signals = pd.Series(np.where((df['ema_fast'].shift(1) <= df['ema_slow'].shift(1)) & (df['ema_fast'] > df['ema_slow']), 1,  # Buy
-                                 np.where((df['ema_fast'].shift(1) >= df['ema_slow'].shift(1)) & (df['ema_fast'] < df['ema_slow']), -1, 0)),  # Sell
+    atr_threshold = 0.0005
+    df['ema_fast'] = df['close'].ewm(span=2).mean()
+    df['ema_slow'] = df['close'].ewm(span=5).mean()
+    signals = pd.Series(np.where((df['ema_fast'].shift(1) <= df['ema_slow'].shift(1)) & (df['ema_fast'] > df['ema_slow']), 1,
+                                 np.where((df['ema_fast'].shift(1) >= df['ema_slow'].shift(1)) & (df['ema_fast'] < df['ema_slow']), -1, 0)),
                         index=df.index)
-    # Improved simulation with ATR filter: Hold trade until reverse signal or end, compute cumulative return
-    position = 0
-    entry_price = 0.0
-    trade_returns = []
-    trade_entries = []  # Store entry points for plotting
-    trade_exits = []   # Store exit points for plotting
+    position, entry_price = 0, 0.0
+    trade_returns, trade_entries, trade_exits = [], [], []
     for i in range(1, len(df)):
-        signal = signals.iloc[i]
-        atr = df['atr'].iloc[i]
-        if atr > atr_threshold:  # Only trade if volatility is sufficient
-            if signal == 1 and position == 0:  # Open buy
-                position = 1
-                entry_price = df['close'].iloc[i]
+        signal, atr = signals.iloc[i], df['atr'].iloc[i]
+        if atr > atr_threshold:
+            if signal == 1 and position == 0:
+                position, entry_price = 1, df['close'].iloc[i]
                 trade_entries.append((df.index[i], entry_price))
-            elif signal == -1 and position == 0:  # Open sell
-                position = -1
-                entry_price = df['close'].iloc[i]
+            elif signal == -1 and position == 0:
+                position, entry_price = -1, df['close'].iloc[i]
                 trade_entries.append((df.index[i], entry_price))
-            elif (signal == -1 and position == 1) or (signal == 1 and position == -1):  # Reverse
-                # Close current, open new
+            elif (signal == -1 and position == 1) or (signal == 1 and position == -1):
                 close_price = df['close'].iloc[i]
                 ret = position * (close_price - entry_price) / entry_price
                 trade_returns.append(ret)
-                trade_exits.append((df.index[i-1], close_price))  # Exit at previous bar's close
-                position = signal
-                entry_price = close_price
+                trade_exits.append((df.index[i-1], close_price))
+                position, entry_price = signal, close_price
                 trade_entries.append((df.index[i], entry_price))
-    # Close last position if open
     if position != 0:
         close_price = df['close'].iloc[-1]
         ret = position * (close_price - entry_price) / entry_price
         trade_returns.append(ret)
         trade_exits.append((df.index[-1], close_price))
-    trade_returns = trade_returns[-10:]  # Last 10 "trades"
+    trade_returns = trade_returns[-10:]
     print(f"Simulated trade returns from data: {trade_returns}")
 
 # Simulate multiple strategies
@@ -206,6 +183,21 @@ plt.legend()
 plt.grid(True)
 plt.savefig('equity_curves.png')
 plt.show()
+
+# Add plot for EMA_RSI_Filter strategy
+if "EMA_RSI_Filter" in strategies:
+    rsi_returns = strategies["EMA_RSI_Filter"]
+    if len(rsi_returns) > 0:
+        plt.figure(figsize=(12, 6))
+        rsi_equity = np.cumprod(1 + np.array(rsi_returns))
+        plt.plot(rsi_equity, label='EMA_RSI_Filter Equity Curve', color='g')
+        plt.title('Equity Curve for EMA_RSI_Filter Strategy')
+        plt.xlabel('Trades')
+        plt.ylabel('Cumulative Return')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('ema_rsi_filter_plot.png')
+        plt.show()
 
 # Calculate VWAP
 df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
