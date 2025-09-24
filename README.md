@@ -6,6 +6,9 @@ Changes Made
 
 Fixed Crossover Logic:
 
+<img width="800" height="600" alt="EURUSDM1511" src="https://github.com/user-attachments/assets/b7adc046-83cb-4297-97d8-124c9c0c7cd9" />
+
+
 Swapped EMA array indices for buy/sell conditions to correctly detect crossings (previous fast vs. slow, then recent fast vs. slow).
 Updated comments and logging for clarity (e.g., "FastEMA[recent]", "FastEMA[older]").
 
